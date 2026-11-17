@@ -299,6 +299,23 @@ async fn fetch_events(
     parsed.as_array().cloned()
 }
 
+/// Whether the channel's relay-signed kind 39000 carries a Buzz Connect
+/// `["connected", <relay>, <name>]` tag. A failed read counts as not shared.
+async fn channel_is_shared(client: &BuzzClient, channel_id: &str) -> bool {
+    let filter = serde_json::json!({ "kinds": [39000], "#d": [channel_id], "limit": 1 });
+    fetch_events(client, &filter)
+        .await
+        .and_then(|events| events.first().cloned())
+        .is_some_and(|event| is_shared_channel_metadata(&event))
+}
+
+fn is_shared_channel_metadata(event: &serde_json::Value) -> bool {
+    event["tags"].as_array().is_some_and(|tags| {
+        tags.iter()
+            .any(|tag| tag.get(0).and_then(|name| name.as_str()) == Some("connected"))
+    })
+}
+
 /// Extract member pubkeys (the `p` tag values) from a single 39002 event.
 async fn fetch_member_pubkeys(
     client: &BuzzClient,
@@ -705,7 +722,10 @@ pub async fn cmd_send_message(
     let mention_pubkeys = merge_message_mentions(&explicit_mentions, &uri_pubkeys, &auto_resolved)?;
 
     let missing = missing_members(&mention_pubkeys, &member_pubkeys);
-    if !missing.is_empty() {
+    // Buzz Connect: the other community's people post in a shared channel
+    // without being members here, so naming them is a reference, not an
+    // invite (docs/buzz-connect.md).
+    if !missing.is_empty() && !channel_is_shared(client, &p.channel_id).await {
         return Err(CliError::Usage(
             serde_json::json!({
                 "message": "mentioned pubkeys are not channel members; add them explicitly before retrying",
@@ -1743,6 +1763,21 @@ mod tests {
             ),
             vec![PK_VALID_B]
         );
+    }
+
+    #[test]
+    fn only_a_connected_tag_marks_a_shared_channel() {
+        use super::is_shared_channel_metadata;
+        let metadata = |tags: serde_json::Value| serde_json::json!({ "kind": 39000, "tags": tags });
+        assert!(is_shared_channel_metadata(&metadata(serde_json::json!([
+            ["d", "c"],
+            ["connected", "wss://a.example", "a.example"]
+        ]))));
+        assert!(!is_shared_channel_metadata(&metadata(serde_json::json!([
+            ["d", "c"],
+            ["name", "connected"]
+        ]))));
+        assert!(!is_shared_channel_metadata(&serde_json::json!({})));
     }
 
     #[test]

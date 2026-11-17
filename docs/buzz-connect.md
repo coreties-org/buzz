@@ -90,7 +90,9 @@ cross-community invite of agents.
    app shows them as agents, with the "· A" marker too.
 4. In the app, @mentioning a remote person or agent produces a reference
    (p-tag and readable name). It never adds them to the local roster and never
-   offers to invite them.
+   offers to invite them. The CLI's `messages send` skips its "mentioned
+   pubkeys are not channel members" refusal in a channel whose kind 39000
+   carries a `connected` tag, so an agent can name the person it answers.
 5. Adding an agent to a shared channel is the same flow as adding any local
    member.
 
