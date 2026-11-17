@@ -167,7 +167,8 @@ An admin of B runs `connect-accept` with the link. B:
    the name is taken on B) and an `active` row holding A's pubkey;
 5. starts its mirror worker; A starts its worker once its row is `active`.
 
-The exact transport of step 3 is fixed in phase 3 and documented here then.
+Step 3 is `POST /api/channel-connect/redeem` on A (see "Handshake, as
+implemented" below).
 A reused, expired or unknown code is refused without saying which.
 
 ### Mirroring
@@ -188,8 +189,9 @@ channel authors is fetched by a second, author-bounded read (phase 2).
 Either admin sends `disconnect`. That side marks its row `disconnected`, stops
 its worker and closes every live socket of the peer's key on every pod
 (`disconnect_pubkey_clusterwide`), so access ends at once, not at the next
-reconnect. The other side learns of it when its next pull is refused and marks
-its own row `disconnected`. Both keep the history they have.
+reconnect. The other side learns of it before its next pull, from
+`POST /api/channel-connect/status`, and marks its own row `disconnected`. Both
+keep the history they have.
 
 ## What crosses community isolation, and what does not
 
@@ -266,15 +268,107 @@ Code: `crates/buzz-relay/src/channel_connect.rs`; storage:
   open relay the retired key afterwards authenticates like any unknown key:
   without the scope, so the private shared channel is closed to it.
 
-Not in phase 1, by design: the loop filter (phase 2 omits events the
-connection supplied, using `mirrored_events`), and the author-bounded kind 0
-read for channel authors (phase 2). Until then a peer cannot read any kind 0.
+- **Loop filter (phase 2).** Serving a peer omits every event with a
+  `mirrored_events` row for that connection: REQ history and HTTP `/query`
+  filter the page by one indexed read, and live fan-out does one read only
+  when a peer socket matched. A peer is never handed back what it supplied.
+- **Profiles (phase 2).** Over HTTP `POST /query` only, a peer may read
+  `{"kinds":[0],"authors":[…]}` (at most 100 authors, no other keys). It gets
+  the current kind 0 of the authors who have a live kind 9, 7, 40003 or 5 in
+  its channel, and nothing for anyone else.
 
 Cost: one indexed read (`channel_connections` by
 `(community_id, peer_pubkey)`) per WebSocket AUTH and per `/query` or
 `/count` request on an open relay; on a closed relay only for keys membership
 already refused. No other route reads it. A per-community cache is the
 obvious next step if open relays at scale adopt this.
+
+### Handshake, as implemented (phase 2)
+
+Code: `crates/buzz-relay/src/channel_connect/handshake.rs`.
+
+- **Commands** are admin-signed events, routed in ingest after the signature,
+  timestamp (±120 s), scope (`admin:channels`) and ban/timeout gates, answered
+  in the `OK` message, never stored or fanned out. The sender must be a
+  community `admin` or `owner`.
+  - kind **9037** `connect-offer`, `["channel", <uuid>]`: stream or forum
+    channels only. The relay makes the keypair and a 256-bit code, stores the
+    code's SHA-256 with a 24 h expiry, and answers with the link
+    `buzz://channel-connect?relay=<A ws url>&channel=<uuid>&code=<hex>`.
+  - kind **9038** `connect-accept`, `["link", <link>]`: B makes its keypair,
+    redeems at A, then creates the channel with A's UUID, name, type,
+    visibility and description, owned by the accepting admin (name clash:
+    `"<name> (<A>)"`). It refuses if a channel with that UUID already exists
+    on B, so A can never steer mirroring into one of B's own channels. Then
+    it records an `active` acceptor row. Answers with the channel UUID.
+  - kind **9039** `disconnect`, `["channel", <uuid>]`: ends every live
+    connection of the channel on this side (see Disconnect).
+- **Relay to relay.** Two HTTP endpoints, NIP-98 signed by the calling side's
+  connection key (URL, method and body hash bound; replay-checked), exempt
+  from the membership gate and NIP-FI because the caller is never a member:
+  - `POST /api/channel-connect/redeem` `{code, channel, relay, name}` →
+    `{pubkey, community_name, channel:{id, name, channel_type, visibility,
+    about}}`. The signing key becomes the admitted peer key. Unknown, used
+    and expired codes all answer 404 with one message.
+  - `POST /api/channel-connect/status` `{}` → `{"active": bool}` for the
+    signing key.
+  This is the one new HTTP surface: the caller cannot authenticate as a member,
+  so an event over `POST /events` would not reach a handler.
+- **Community name.** The community's host, until communities carry a
+  display name.
+- **Group state.** The channel's relay-signed kind 39000 carries
+  `["connected", <peer relay url>, <peer community name>]` per active
+  connection; offer redemption, accept and disconnect (either side)
+  republish it.
+- **CLI.** `buzz channels connect --channel <uuid>` prints the write response
+  plus `link`; `buzz channels accept --link <link>` adds `channel_id`;
+  `buzz channels disconnect --channel <uuid>`.
+
+Known gap: accept is two writes on B after A redeemed (the channel, then the
+row). If B fails between them, A holds an active connection nobody pulls and
+B a channel without a connection; an admin disconnects on A and deletes the
+channel on B. A retry needs a new link.
+
+### Mirroring, as implemented (phase 2)
+
+Code: `crates/buzz-relay/src/channel_connect/mirror.rs` and
+`IngestAuth::Mirror` in `handlers/ingest.rs`.
+
+- **Supervisor.** Every pod runs one; the pod holding the advisory lock
+  `BUZZCONN` runs one worker per `active` row across communities, re-reading
+  the rows every 30 s and at once after an offer is redeemed, an accept or a
+  disconnect on this pod.
+- **Worker.** Asks the peer's status endpoint, then authenticates over NIP-42
+  with the connection key and sends `REQ live {kinds:[9,7,40003,5], #h, since:
+  cursor, limit: 500}`. A full first page pages back with `until` on extra
+  subscriptions while `live` stays open, so history and live overlap. Events
+  apply in `(created_at, id)` order. One whose parent, reaction target or
+  edit/delete target is missing waits and is retried after each batch and
+  every 30 s idle, at most 6 passes, then dropped with a warning. The durable
+  cursor moves to the last applied event only when nothing waits, so a
+  restart re-reads (storage is idempotent). After each batch the worker reads
+  the kind 0 of new authors (once per session). Errors reconnect with 1 s–60 s
+  exponential backoff plus jitter.
+- **Mirror path.** The event is first recorded in `mirrored_events` (so the
+  loop filter already hides it from the peer when its fan-out runs), then
+  stored through `ingest_event` with `IngestAuth::Mirror`. That path admits
+  the event as its own author for the synced kinds and kind 0 only, and only
+  in the connection's channel (kind 0 only global). It skips exactly: the
+  ±900 s drift check, the channel membership gate, and the media/link-preview
+  reference checks (the media lives on the peer's Blossom, decision 9). It
+  keeps signature verification, bans and timeouts of the author on this side,
+  thread metadata and counters, reaction bookkeeping, and the normal fan-out,
+  mention and push path. Edits and kind 5 deletions must be by the target's
+  author (an agent's owner may not, unlike locally).
+- **Exactly once.** Only an insert that is new fans out and notifies; a
+  re-read event is a duplicate and does nothing. A p-tagged local member or
+  agent subscribed per channel (as `buzz-acp` does) receives a mirrored
+  mention once.
+- **Remote profiles** are stored as kind 0 events with their tags (bot and
+  NIP-OA markers intact), without the side effect that writes `users`, so the
+  author has no `users` row here, and people search leaves out kind 0 events
+  recorded in `mirrored_events`. Members can still read them by author, which
+  is how names and avatars render.
 
 ## Security notes
 
@@ -302,9 +396,8 @@ obvious next step if open relays at scale adopt this.
 
 1. This document; `channel_connections` and `mirrored_events` with store
    functions; scoped admission for connection keys.
-2. Mirror path and worker; loop filter; exactly-once fan-out; agents.
-3. Handshake operations, CLI, `["connected", url, name]` on the channel's
+2. Mirror path and worker; loop filter; exactly-once fan-out; agents;
+   handshake operations, CLI, `["connected", url, name]` on the channel's
    kind 39000.
-4. App: connect/accept UI, shared badge, remote author markers, mentions.
-5. Try-out environment with two relays.
-6. End-to-end verification.
+3. App: connect/accept UI, shared badge, remote author markers, mentions.
+4. Try-out kit with two relays, rehearsal, review.
