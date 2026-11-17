@@ -1390,7 +1390,11 @@ pub(crate) async fn await_client_close(mut ws_recv: futures_util::stream::SplitS
     }
 }
 
-async fn handle_text_message(text: String, conn: Arc<ConnectionState>, state: Arc<AppState>) {
+pub(crate) async fn handle_text_message(
+    text: String,
+    conn: Arc<ConnectionState>,
+    state: Arc<AppState>,
+) {
     // B2: Frame admission fence. If the connection's NIP-FI session has already
     // expired (cancel fired by the expiry task), drop this frame before any
     // handler dispatch. This closes the window where a buffered EVENT/REQ/AUTH
@@ -1794,6 +1798,7 @@ pub(crate) mod tests {
             pubkey: Keys::generate().public_key(),
             scopes: Vec::new(),
             channel_ids: None,
+            peer_connection: None,
             auth_method: AuthMethod::Nip42,
             agent_owner_pubkey: None,
         }

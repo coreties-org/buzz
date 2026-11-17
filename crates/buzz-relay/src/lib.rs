@@ -6,6 +6,7 @@
 pub(crate) mod access;
 mod admission;
 mod build_info;
+mod channel_connect;
 mod community_active;
 mod fenced_cache;
 mod host_cache;

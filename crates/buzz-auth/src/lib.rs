@@ -120,10 +120,16 @@ pub struct AuthContext {
     pub pubkey: nostr::PublicKey,
     /// Permission scopes granted to this connection.
     pub scopes: Vec<Scope>,
-    /// Channel restriction (reserved for future per-channel access control).
+    /// Channel restriction.
     ///
-    /// `None` means unrestricted.
+    /// `None` means unrestricted. For a scoped token it narrows the caller's
+    /// own channel access; for a peer connection (`peer_connection` set) it
+    /// *replaces* it: exactly these channels, member or not.
     pub channel_ids: Option<Vec<uuid::Uuid>>,
+    /// The Buzz Connect connection whose peer key this is, when the caller is
+    /// another relay pulling a shared channel (docs/buzz-connect.md). Such a
+    /// caller may only read `channel_ids`.
+    pub peer_connection: Option<uuid::Uuid>,
     /// How the connection was authenticated.
     pub auth_method: AuthMethod,
     /// NIP-OA verified owner pubkey (if authenticated via owner attestation).
@@ -191,6 +197,7 @@ impl AuthService {
             pubkey: auth_event.pubkey,
             scopes: Scope::all_known(),
             channel_ids: None,
+            peer_connection: None,
             auth_method: AuthMethod::Nip42,
             agent_owner_pubkey: None, // Set later by relay membership gate if NIP-OA
         })
@@ -243,6 +250,7 @@ mod tests {
             pubkey: keys.public_key(),
             scopes: vec![Scope::MessagesRead, Scope::ChannelsRead],
             channel_ids: None,
+            peer_connection: None,
             auth_method: AuthMethod::Nip42,
             agent_owner_pubkey: None,
         };

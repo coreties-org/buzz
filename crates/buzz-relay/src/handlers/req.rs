@@ -85,7 +85,7 @@ pub async fn handle_admitted_req(
     state: Arc<AppState>,
 ) {
     let mut access = crate::access::ReadLog::req(&conn, &sub_id, &filters);
-    let (conn_id, pubkey_bytes, token_channel_ids) = {
+    let (conn_id, pubkey_bytes, token_channel_ids, peer) = {
         match conn.auth_state_snapshot() {
             AuthState::Authenticated(ctx) => {
                 if !ctx.scopes.is_empty() && !ctx.scopes.contains(&Scope::MessagesRead) {
@@ -104,7 +104,12 @@ pub async fn handle_admitted_req(
 
                 let pk_bytes = ctx.pubkey.to_bytes().to_vec();
 
-                (conn.conn_id, pk_bytes, ctx.channel_ids.clone())
+                (
+                    conn.conn_id,
+                    pk_bytes,
+                    ctx.channel_ids.clone(),
+                    ctx.peer_connection.is_some(),
+                )
             }
             _ => {
                 super::close::refuse_if_owner_with_notice(
@@ -146,7 +151,11 @@ pub async fn handle_admitted_req(
     let (named_channels, live_names) =
         super::system_channels::channels_named_by_filters(&filters, MAX_EXPLICIT_CHANNEL_VALUES);
 
-    let mut accessible_channels = if filters_are_nip43_membership_only(&filters) {
+    // A Buzz Connect peer key reads exactly its connection's channels, member
+    // or not (its filters were confirmed inside them at admission).
+    let mut accessible_channels = if peer {
+        token_channel_ids.clone().unwrap_or_default()
+    } else if filters_are_nip43_membership_only(&filters) {
         metrics::counter!("buzz_req_global_access_resolution_skips_total", "kind" => "13534")
             .increment(1);
         Vec::new()
@@ -4300,6 +4309,7 @@ mod tests {
                     pubkey: keys.public_key(),
                     scopes: vec![],
                     channel_ids: None,
+                    peer_connection: None,
                     auth_method: buzz_auth::AuthMethod::Nip42,
                     agent_owner_pubkey: None,
                 },
@@ -4430,6 +4440,7 @@ mod tests {
                     pubkey: keys.public_key(),
                     scopes: vec![],
                     channel_ids: None,
+                    peer_connection: None,
                     auth_method: buzz_auth::AuthMethod::Nip42,
                     agent_owner_pubkey: None,
                 },
@@ -4566,6 +4577,7 @@ mod tests {
                     pubkey: keys.public_key(),
                     scopes: vec![],
                     channel_ids: None,
+                    peer_connection: None,
                     auth_method: buzz_auth::AuthMethod::Nip42,
                     agent_owner_pubkey: None,
                 },
@@ -4708,6 +4720,7 @@ mod tests {
                     pubkey: keys.public_key(),
                     scopes: vec![],
                     channel_ids: None,
+                    peer_connection: None,
                     auth_method: buzz_auth::AuthMethod::Nip42,
                     agent_owner_pubkey: None,
                 },

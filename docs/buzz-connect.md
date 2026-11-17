@@ -224,30 +224,57 @@ members or other channels through it.
 
 ### Scoped access, as implemented (phase 1)
 
-When a socket authenticates with a key that matches an `active`
-`channel_connections.peer_pubkey` in the community, the relay admits it as a
-*peer connection*:
+Code: `crates/buzz-relay/src/channel_connect.rs`; storage:
+`crates/buzz-db/src/store/channel_connection.rs`.
 
-- `AuthContext.channel_ids = Some([channel])` and the context is marked as a
-  peer connection. For a peer, `channel_ids` *replaces* the membership-derived
-  channel set instead of narrowing it.
-- Every REQ and COUNT filter must name the channel in `#h` (and nothing else
-  there), must list `kinds`, all from 9, 7, 40003 and 5, and must not carry
-  `search`. Anything else is refused with `restricted:`. Live fan-out follows
-  the same scope, because the subscription is registered from those filters.
-- EVENT, artifact sync, and every HTTP route except `POST /query` and
-  `POST /count` refuse the key. Those two apply the same filter rule.
-- Relay membership checks never admit a connection key: on a closed relay it
-  is not a member; on an open relay `check_membership` answers *denied* for
-  an active connection key instead of *open*. Only the scoped paths above
-  admit it, so any other route fails closed.
-- Revoking a connection (disconnect) sets the row `disconnected` and closes
-  the key's sockets on every pod. HTTP requests read the row each time, so
-  they stop at once too.
+- **Admission.** A connection key is never a relay member. Three seams
+  recognise it as a peer when it matches an `active` row: WebSocket AUTH,
+  `POST /query` and `POST /count`. On a closed relay they look only after
+  membership refused the key, so members pay nothing extra, and every other
+  route (media, git, huddles, workflows, invites, `POST /events`, the v1 API,
+  …) refuses it like any non-member. On an open relay, where membership
+  admits every key, those three seams look first; other routes treat the key
+  like any unknown key. That grants nothing the peer relay could not get by
+  authenticating with a fresh key, and the private shared channel stays
+  closed there. A NIP-FI session or agent token is never treated as a peer.
+- **Scope.** On the socket, `AuthContext.channel_ids = Some([channel])` and
+  `AuthContext.peer_connection = Some(connection id)`. For a peer,
+  `channel_ids` *replaces* the membership-derived channel set in REQ and
+  COUNT instead of narrowing it, so a private channel works without a
+  membership row. Admission joins the key to nothing (no default or
+  open-relay auto-join).
+- **Filters.** Every REQ and COUNT filter must name only the channel in a
+  non-empty `#h`, must list `kinds`, all from 9, 7, 40003 and 5, and must not
+  carry `search`. Anything else is refused with `CLOSED`
+  (`restricted: …`), not answered empty. Over HTTP, filters may carry only
+  `ids`, `authors`, `kinds`, `since`, `until`, `limit` and `#x` tags: bridge
+  extensions (thread windows, feeds, snapshots, artifact reads) answer from
+  the caller's own membership and are refused (403). A COUNT must be exactly
+  countable in SQL.
+- **Writes.** `EVENT` and artifact sync are refused on the socket
+  (`OK false` / `CLOSED`, `restricted: a channel connection is read-only`);
+  HTTP writes are refused by membership.
+- **Live fan-out.** The socket's subscriptions are registered from those
+  filters, and the fan-out access gate decides a peer connection on its own:
+  it receives events of the synced kinds in its channel, member or not, and
+  nothing else, whatever its subscriptions match. The channel is recorded on
+  the connection-manager entry at AUTH, so this costs no database read.
+- **Revocation.** `channel_connect::disconnect` marks the row
+  `disconnected` and closes the key's sockets on every pod at once. The final
+  admission fence re-reads the row from the writer, so a disconnect that
+  races an AUTH cannot be undone. HTTP requests read the row each time. On an
+  open relay the retired key afterwards authenticates like any unknown key:
+  without the scope, so the private shared channel is closed to it.
 
-Cost: on an open relay, each membership check does one extra indexed read
-(`channel_connections` by `(community_id, peer_pubkey)`). On a closed relay,
-members pay nothing extra; only refused non-members are looked up.
+Not in phase 1, by design: the loop filter (phase 2 omits events the
+connection supplied, using `mirrored_events`), and the author-bounded kind 0
+read for channel authors (phase 2). Until then a peer cannot read any kind 0.
+
+Cost: one indexed read (`channel_connections` by
+`(community_id, peer_pubkey)`) per WebSocket AUTH and per `/query` or
+`/count` request on an open relay; on a closed relay only for keys membership
+already refused. No other route reads it. A per-community cache is the
+obvious next step if open relays at scale adopt this.
 
 ## Security notes
 

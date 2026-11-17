@@ -66,12 +66,27 @@ pub(crate) async fn enforce_ws_admission(
         return Ok(());
     }
 
-    let (pubkey, is_agent) = {
+    let (pubkey, is_agent, peer_channels) = {
         match conn.auth_state_snapshot() {
-            AuthState::Authenticated(ctx) => (ctx.pubkey, ctx.agent_owner_pubkey.is_some()),
+            AuthState::Authenticated(ctx) => (
+                ctx.pubkey,
+                ctx.agent_owner_pubkey.is_some(),
+                ctx.peer_connection
+                    .map(|_| ctx.channel_ids.unwrap_or_default()),
+            ),
             _ => return Ok(()),
         }
     };
+
+    // A Buzz Connect peer key reads its channel and nothing else, and never
+    // writes. Refused before any quota is spent.
+    if let Some(channels) = peer_channels {
+        if let Some(reason) = crate::channel_connect::frame_refusal(msg, &channels) {
+            metrics::counter!("buzz_admission_rejections_total", "transport" => "websocket", "reason" => "peer_scope", "bucket" => "peer_connection").increment(1);
+            refuse(conn, state, msg, reason, "peer_connection_scope").await;
+            return Err("peer_connection_scope");
+        }
+    }
 
     let limits = &state.auth.config().rate_limits;
     let (ws_window_secs, ws_limit) =
@@ -139,22 +154,30 @@ async fn send_admission_result(
         ),
     };
     metrics::counter!("buzz_admission_rejections_total", "transport" => "websocket", "reason" => label, "bucket" => bucket).increment(1);
+    refuse(conn, state, msg, &reason, logged).await;
+    Err(logged)
+}
+
+/// Sends `reason` on `msg`'s own acknowledgement channel.
+async fn refuse(
+    conn: &ConnectionState,
+    state: &AppState,
+    msg: &ClientMessage,
+    reason: &str,
+    logged: &'static str,
+) {
     match msg {
         // A refused REQ or sync retires whatever held its ID before `CLOSED`.
         ClientMessage::Req { sub_id, .. } | ClientMessage::ArtifactSync { sub_id, .. } => {
-            crate::handlers::close::refuse(sub_id, &reason, conn, state).await;
+            crate::handlers::close::refuse(sub_id, reason, conn, state).await;
         }
         _ => {
-            let queued = conn.send(request_rejection_message(
-                rejection_target_for(msg),
-                &reason,
-            ));
+            let queued = conn.send(request_rejection_message(rejection_target_for(msg), reason));
             if let ClientMessage::Event(event) = msg {
                 crate::access::WriteLog::refused(conn, event, logged, queued);
             }
         }
     }
-    Err(logged)
 }
 
 #[cfg(test)]
