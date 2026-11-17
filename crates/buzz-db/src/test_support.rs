@@ -733,3 +733,26 @@ impl PausingProxy {
 
 mod recent_pass_tests;
 pub(crate) use recent_pass_tests::replace_between_passes;
+
+/// Create the tenant tables that migrations after the universal-fence
+/// retirement (0090) add, from their own migration file. Tests that stop a
+/// database before 0090 to model the retirement use this so the database
+/// still holds every table this binary's deletion catalog expects; a test
+/// that then runs the remaining migrations drops them first with
+/// [`drop_tables_added_after_fence_retirement`].
+pub(crate) async fn create_tables_added_after_fence_retirement(pool: &sqlx::PgPool) {
+    sqlx::raw_sql(include_str!(
+        "../../../migrations/0093_channel_connections.sql"
+    ))
+    .execute(pool)
+    .await
+    .expect("create tables added after the fence retirement");
+}
+
+/// Undo [`create_tables_added_after_fence_retirement`].
+pub(crate) async fn drop_tables_added_after_fence_retirement(pool: &sqlx::PgPool) {
+    sqlx::raw_sql("DROP TABLE channel_connections; DROP TABLE mirrored_events;")
+        .execute(pool)
+        .await
+        .expect("drop tables added after the fence retirement");
+}

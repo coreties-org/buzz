@@ -4706,6 +4706,7 @@ mod postgres_tests {
         crate::migration::run_migrations_through(&db.pool, 89)
             .await
             .expect("migrate with fence objects present");
+        crate::test_support::create_tables_added_after_fence_retirement(&db.pool).await;
         let store = db.deletion_store();
         let community = db
             .ensure_configured_community("optional-fences.example")
