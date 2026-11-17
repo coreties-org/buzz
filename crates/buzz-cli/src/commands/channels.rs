@@ -2052,7 +2052,80 @@ pub async fn dispatch(
             cmd_remove_channel_member(client, &channel, &pubkey).await
         }
         ChannelsCmd::SetAddPolicy { policy } => cmd_set_add_policy(client, &policy).await,
+        ChannelsCmd::Connect { channel } => cmd_connect_channel(client, &channel).await,
+        ChannelsCmd::Accept { link } => cmd_accept_channel_connect(client, &link).await,
+        ChannelsCmd::Disconnect { channel } => cmd_disconnect_channel(client, &channel).await,
     }
+}
+
+/// Sign and submit one Buzz Connect command; returns the relay's write
+/// response as JSON, with the `OK` message the relay answered.
+async fn submit_connect_command(
+    client: &BuzzClient,
+    kind: u32,
+    tag: [&str; 2],
+) -> Result<serde_json::Value, CliError> {
+    let builder = nostr::EventBuilder::new(nostr::Kind::Custom(kind as u16), "")
+        .tags([nostr::Tag::parse(tag).map_err(|e| CliError::Other(format!("tag: {e}")))?]);
+    let event = client.sign_event(builder).await?;
+    let resp = client.submit_event(event).await?;
+    let normalized: serde_json::Value = serde_json::from_str(&normalize_write_response(&resp))
+        .map_err(|e| CliError::Other(format!("unexpected relay response: {e}")))?;
+    if normalized["accepted"] != serde_json::json!(true) {
+        return Err(CliError::Relay {
+            status: 200,
+            body: normalized["message"]
+                .as_str()
+                .unwrap_or("rejected")
+                .to_string(),
+        });
+    }
+    Ok(normalized)
+}
+
+/// `buzz channels connect`: print the one-time link as `link`.
+pub async fn cmd_connect_channel(client: &BuzzClient, channel_id: &str) -> Result<(), CliError> {
+    let channel = parse_uuid(channel_id)?.to_string();
+    let mut out = submit_connect_command(
+        client,
+        buzz_core::kind::KIND_CHANNEL_CONNECT_OFFER,
+        ["channel", &channel],
+    )
+    .await?;
+    out["link"] = out["message"].clone();
+    println!("{out}");
+    Ok(())
+}
+
+/// `buzz channels accept`: print the shared channel's id as `channel_id`.
+pub async fn cmd_accept_channel_connect(client: &BuzzClient, link: &str) -> Result<(), CliError> {
+    if !link.starts_with("buzz://channel-connect?") {
+        return Err(CliError::Usage(
+            "--link must be a buzz://channel-connect?... link".into(),
+        ));
+    }
+    let mut out = submit_connect_command(
+        client,
+        buzz_core::kind::KIND_CHANNEL_CONNECT_ACCEPT,
+        ["link", link],
+    )
+    .await?;
+    out["channel_id"] = out["message"].clone();
+    println!("{out}");
+    Ok(())
+}
+
+/// `buzz channels disconnect`.
+pub async fn cmd_disconnect_channel(client: &BuzzClient, channel_id: &str) -> Result<(), CliError> {
+    let channel = parse_uuid(channel_id)?.to_string();
+    let out = submit_connect_command(
+        client,
+        buzz_core::kind::KIND_CHANNEL_DISCONNECT,
+        ["channel", &channel],
+    )
+    .await?;
+    println!("{out}");
+    Ok(())
 }
 
 pub async fn dispatch_canvas(cmd: crate::CanvasCmd, client: &BuzzClient) -> Result<(), CliError> {

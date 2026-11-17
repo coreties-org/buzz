@@ -1035,6 +1035,35 @@ pub enum ChannelsCmd {
         #[arg(long)]
         pubkey: String,
     },
+    /// Share a channel with another community (Buzz Connect, admins only).
+    /// Prints a one-time `buzz://channel-connect` link, valid for 24 hours;
+    /// an admin of the other community accepts it.
+    #[command(
+        after_help = "Examples:\n  buzz channels connect --channel <UUID>\n  buzz channels connect --channel <UUID> | jq -r .link"
+    )]
+    Connect {
+        /// Channel UUID (stream or forum)
+        #[arg(long)]
+        channel: String,
+    },
+    /// Accept another community's channel-connect link (admins only). The
+    /// shared channel appears here with the same UUID.
+    #[command(
+        after_help = "Examples:\n  buzz channels accept --link 'buzz://channel-connect?relay=wss%3A%2F%2Fa.example&channel=<UUID>&code=<CODE>'"
+    )]
+    Accept {
+        /// The `buzz://channel-connect?...` link from the other community
+        #[arg(long)]
+        link: String,
+    },
+    /// End a shared channel's connection from this side (admins only).
+    /// Both sides keep the history up to now.
+    #[command(after_help = "Examples:\n  buzz channels disconnect --channel <UUID>")]
+    Disconnect {
+        /// Channel UUID
+        #[arg(long)]
+        channel: String,
+    },
     /// Set your channel addition policy
     #[command(name = "set-add-policy")]
     SetAddPolicy {
@@ -3063,10 +3092,13 @@ mod tests {
         assert_eq!(
             names(&cmd, "channels"),
             vec![
+                "accept",
                 "add-member",
                 "archive",
+                "connect",
                 "create",
                 "delete",
+                "disconnect",
                 "get",
                 "join",
                 "leave",
@@ -3191,7 +3223,7 @@ mod tests {
         let expected: Vec<(&str, usize)> = vec![
             ("agents", 5),
             ("canvas", 4),
-            ("channels", 17),
+            ("channels", 20),
             ("dms", 4),
             ("emoji", 5),
             ("feed", 1),
