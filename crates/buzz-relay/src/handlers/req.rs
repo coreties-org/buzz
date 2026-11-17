@@ -108,7 +108,7 @@ pub async fn handle_admitted_req(
                     conn.conn_id,
                     pk_bytes,
                     ctx.channel_ids.clone(),
-                    ctx.peer_connection.is_some(),
+                    ctx.peer_connection,
                 )
             }
             _ => {
@@ -153,7 +153,7 @@ pub async fn handle_admitted_req(
 
     // A Buzz Connect peer key reads exactly its connection's channels, member
     // or not (its filters were confirmed inside them at admission).
-    let mut accessible_channels = if peer {
+    let mut accessible_channels = if peer.is_some() {
         token_channel_ids.clone().unwrap_or_default()
     } else if filters_are_nip43_membership_only(&filters) {
         metrics::counter!("buzz_req_global_access_resolution_skips_total", "kind" => "13534")
@@ -691,7 +691,32 @@ pub async fn handle_admitted_req(
                 );
             }
 
+            // Buzz Connect loop filter: never serve a peer the events it supplied.
+            let supplied = match peer {
+                Some(connection_id) => {
+                    let ids: Vec<Vec<u8>> = events
+                        .iter()
+                        .map(|e| e.event.id.as_bytes().to_vec())
+                        .collect();
+                    match state
+                        .db
+                        .mirrored_event_ids_from(conn.tenant.community(), connection_id, &ids)
+                        .await
+                    {
+                        Ok(supplied) => supplied,
+                        Err(e) => {
+                            access.error("database_error");
+                            return Some(history_read_closed_reason(&e));
+                        }
+                    }
+                }
+                None => std::collections::HashSet::new(),
+            };
+
             for stored in &events {
+                if supplied.contains(stored.event.id.as_bytes().as_slice()) {
+                    continue;
+                }
                 // Per-filter NIP-01 matching — use the current filter only, not the
                 // full filter set. OR semantics across filters are handled by the outer
                 // loop (each filter gets its own DB query).

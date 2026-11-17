@@ -512,6 +512,80 @@ impl Db {
             .map(|row| row.try_get::<Vec<u8>, _>("event_id").map_err(Into::into))
             .collect()
     }
+
+    /// Record that `connection_id` supplied `event_id` from
+    /// `origin_relay_url`, in its own transaction. The mirror path calls this
+    /// before it stores the event, so the loop filter already omits the event
+    /// when its fan-out reaches the peer's socket. Returns `false` when the
+    /// event was already recorded.
+    #[datastore_span(name = "record_mirrored_event", system = "postgresql")]
+    pub async fn record_mirrored_event(
+        &self,
+        community: CommunityId,
+        connection_id: Uuid,
+        event_id: &[u8],
+        origin_relay_url: &str,
+    ) -> Result<bool> {
+        let mut tx = crate::begin_community_write_transaction(
+            &self.pool,
+            community,
+            WriterOperation::EventWrite,
+        )
+        .await?;
+        let recorded =
+            record_mirrored_event(&mut tx, connection_id, event_id, origin_relay_url).await?;
+        tx.commit().await?;
+        Ok(recorded)
+    }
+
+    /// The pubkeys among `pubkeys` (32-byte) that have a live event of the
+    /// synced kinds (9, 7, 40003, 5) in `channel_id`: the authors a peer may
+    /// read the profiles of.
+    #[datastore_span(name = "channel_authors_among", system = "postgresql")]
+    pub async fn channel_authors_among(
+        &self,
+        community: CommunityId,
+        channel_id: Uuid,
+        pubkeys: &[Vec<u8>],
+    ) -> Result<std::collections::HashSet<Vec<u8>>> {
+        if pubkeys.is_empty() {
+            return Ok(std::collections::HashSet::new());
+        }
+        let mut conn = acquire_writer(&self.pool, WriterOperation::SubscriptionHistory).await?;
+        let rows = sqlx::query(
+            "SELECT DISTINCT pubkey FROM events \
+             WHERE community_id = $1 AND pubkey = ANY($2) AND kind IN (9, 7, 40003, 5) \
+               AND channel_id = $3 AND deleted_at IS NULL",
+        )
+        .bind(community.as_uuid())
+        .bind(pubkeys)
+        .bind(channel_id)
+        .fetch_all(&mut *conn)
+        .await?;
+        rows.iter()
+            .map(|row| row.try_get::<Vec<u8>, _>("pubkey").map_err(Into::into))
+            .collect()
+    }
+
+    /// Every `active` connection on this deployment, across communities, for
+    /// the mirror supervisor. Oldest first.
+    #[datastore_span(name = "all_active_channel_connections", system = "postgresql")]
+    pub async fn all_active_channel_connections(&self) -> Result<Vec<ChannelConnection>> {
+        let mut conn = acquire_writer(&self.pool, WriterOperation::Authorization).await?;
+        let rows = sqlx::query(concat!(
+            "SELECT community_id,",
+            columns!(),
+            "FROM channel_connections WHERE state = 'active' ORDER BY created_at, id"
+        ))
+        .fetch_all(&mut *conn)
+        .await?;
+        rows.iter()
+            .map(|row| {
+                let community = CommunityId::from_uuid(row.try_get("community_id")?);
+                from_row(community, row)
+            })
+            .collect()
+    }
 }
 
 /// Record, inside the mirror path's admitted transaction, that

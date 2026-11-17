@@ -146,7 +146,9 @@ struct FanoutAccess {
 ///
 /// A Buzz Connect peer connection is decided here, without a membership
 /// read: it receives its own channel's synced kinds, member or not, and
-/// nothing else, whatever its subscriptions match.
+/// nothing else, whatever its subscriptions match. An event that peer
+/// supplied is never sent back to it (loop filter); that costs one read,
+/// only when a peer socket matched.
 async fn check_fanout_access(
     state: &AppState,
     community_id: CommunityId,
@@ -156,19 +158,39 @@ async fn check_fanout_access(
 ) -> FanoutAccess {
     let (peers, matches): (Vec<_>, Vec<_>) = matches
         .into_iter()
-        .partition(|(conn_id, _)| state.conn_manager.peer_channel_for_conn(*conn_id).is_some());
+        .partition(|(conn_id, _)| state.conn_manager.peer_scope_for_conn(*conn_id).is_some());
     let mut access =
         check_member_fanout_access(state, community_id, stored_event, matches, threaded).await;
-    if !peers.is_empty() {
-        let readable = crate::channel_connect::PEER_READABLE_KINDS
-            .contains(&event_kind_u32(&stored_event.event));
-        access
-            .allowed
-            .extend(peers.into_iter().filter(|(conn_id, _)| {
-                readable
-                    && state.conn_manager.community_for_conn(*conn_id) == Some(community_id)
-                    && state.conn_manager.peer_channel_for_conn(*conn_id) == stored_event.channel_id
-            }));
+    if peers.is_empty() {
+        return access;
+    }
+    let readable =
+        crate::channel_connect::PEER_READABLE_KINDS.contains(&event_kind_u32(&stored_event.event));
+    let mut in_scope = Vec::new();
+    for (conn_id, sub_id) in peers {
+        let Some(scope) = state.conn_manager.peer_scope_for_conn(conn_id) else {
+            continue;
+        };
+        if readable
+            && state.conn_manager.community_for_conn(conn_id) == Some(community_id)
+            && Some(scope.channel_id) == stored_event.channel_id
+        {
+            in_scope.push((scope.connection_id, (conn_id, sub_id)));
+        }
+    }
+    for (connection_id, recipient) in in_scope {
+        match crate::channel_connect::supplied_by(
+            state,
+            community_id,
+            connection_id,
+            stored_event.event.id.as_bytes(),
+        )
+        .await
+        {
+            Ok(false) => access.allowed.push(recipient),
+            Ok(true) => {}
+            Err(_) => access.unverified.push(recipient),
+        }
     }
     access
 }

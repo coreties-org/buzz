@@ -244,6 +244,11 @@ fn normalized_search_text(q: &str) -> Option<String> {
     }
 }
 
+/// Buzz Connect: a profile mirrored from a peer relay names an author of a
+/// shared channel, not a person of this community, so search never finds it
+/// (docs/buzz-connect.md). Mirrored messages stay searchable in their channel.
+const NOT_MIRRORED_PROFILE: &str = " AND (events.kind <> 0 OR NOT EXISTS (SELECT 1 FROM mirrored_events m WHERE m.community_id = events.community_id AND m.event_id = events.id))";
+
 /// Execute a community-scoped FTS query.
 ///
 /// The mode-specific tsquery is resolved first and bound as a value, so the
@@ -331,6 +336,7 @@ pub async fn search(pool: &PgPool, query: &SearchQuery) -> Result<SearchResult, 
 
     // Search is a current-state surface; old artifact snapshots cannot match.
     qb.push(" AND (events.kind <> 45010 OR EXISTS (SELECT 1 FROM artifact_heads ah WHERE ah.community_id=events.community_id AND ah.event_id=events.id AND NOT ah.deleted))");
+    qb.push(NOT_MIRRORED_PROFILE);
 
     // Channel scope — see `ChannelScope` doc for the four-case mapping. The
     // emitted SQL fragments are identical to the legacy 2x2 tuple for the
@@ -503,7 +509,9 @@ pub async fn search_profile_names(
     qb.push(
         " AND e.kind = 0 AND e.channel_id IS NULL AND e.deleted_at IS NULL \
          AND e.search_tsv @@ search_query.query \
-         AND names.tsv @@ search_query.query",
+         AND names.tsv @@ search_query.query \
+         AND NOT EXISTS (SELECT 1 FROM mirrored_events m \
+                         WHERE m.community_id = e.community_id AND m.event_id = e.id)",
     );
     if let Some(author) = verified_by {
         qb.push(" UNION ALL SELECT decode(pubkey, 'hex'), ");

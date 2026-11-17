@@ -25,6 +25,9 @@ use uuid::Uuid;
 use crate::protocol::ClientMessage;
 use crate::state::AppState;
 
+pub(crate) mod handshake;
+pub(crate) mod mirror;
+
 /// The event kinds a peer connection may read from its channel.
 pub(crate) const PEER_READABLE_KINDS: [u32; 4] = [
     KIND_STREAM_MESSAGE,
@@ -52,6 +55,49 @@ pub(crate) async fn peer_scope(
         .db
         .active_peer_connection(community, &hex::encode(pubkey))
         .await
+}
+
+/// Whether `connection_id` supplied `event_id` here through the mirror path.
+/// Serving that peer omits such events, so nothing echoes back (loop filter).
+pub(crate) async fn supplied_by(
+    state: &AppState,
+    community: CommunityId,
+    connection_id: Uuid,
+    event_id: &[u8],
+) -> buzz_db::Result<bool> {
+    Ok(!state
+        .db
+        .mirrored_event_ids_from(community, connection_id, &[event_id.to_vec()])
+        .await?
+        .is_empty())
+}
+
+/// Most authors one profile read may name.
+const MAX_PROFILE_AUTHORS: usize = 100;
+
+/// The authors of a peer's profile read: a filter of exactly `kinds:[0]`
+/// and 1..=100 `authors`, with at most a `limit` beside them. `None` for
+/// any other filter.
+fn profile_read_authors(raw: &Value) -> Option<Vec<Vec<u8>>> {
+    let fields = raw.as_object()?;
+    if !fields
+        .keys()
+        .all(|key| matches!(key.as_str(), "kinds" | "authors" | "limit"))
+        || fields.get("kinds")? != &serde_json::json!([0])
+    {
+        return None;
+    }
+    let authors = fields.get("authors")?.as_array()?;
+    if authors.is_empty() || authors.len() > MAX_PROFILE_AUTHORS {
+        return None;
+    }
+    authors
+        .iter()
+        .map(|author| {
+            let bytes = hex::decode(author.as_str()?).ok()?;
+            (bytes.len() == 32).then_some(bytes)
+        })
+        .collect()
 }
 
 /// `None` when every filter stays inside `channels`; otherwise the refusal.
@@ -118,6 +164,20 @@ pub(crate) async fn http_read(
     };
     let raw: Vec<Value> = serde_json::from_slice(body)
         .map_err(|_| refuse(StatusCode::BAD_REQUEST, "invalid filters"))?;
+    // Profiles of the channel's authors, and of nobody else.
+    if !count && !raw.is_empty() {
+        if let Some(authors) = raw
+            .iter()
+            .map(profile_read_authors)
+            .collect::<Option<Vec<_>>>()
+        {
+            let authors: Vec<Vec<u8>> = authors.into_iter().flatten().collect();
+            return read_author_profiles(state, tenant, scope, &authors)
+                .await
+                .map(Json)
+                .map_err(|_| refuse(StatusCode::SERVICE_UNAVAILABLE, "query failed"));
+        }
+    }
     let plain = raw.iter().all(|filter| {
         filter.as_object().is_some_and(|fields| {
             fields
@@ -171,8 +231,20 @@ pub(crate) async fn http_read(
             .query_events(&query)
             .await
             .map_err(|_| refuse(StatusCode::SERVICE_UNAVAILABLE, "query failed"))?;
+        let ids: Vec<Vec<u8>> = rows
+            .iter()
+            .map(|row| row.event.id.as_bytes().to_vec())
+            .collect();
+        let supplied = state
+            .db
+            .mirrored_event_ids_from(tenant.community(), scope.connection_id, &ids)
+            .await
+            .map_err(|_| refuse(StatusCode::SERVICE_UNAVAILABLE, "query failed"))?;
         for row in rows {
-            if row.channel_id == Some(scope.channel_id) && seen.insert(row.event.id) {
+            if row.channel_id == Some(scope.channel_id)
+                && !supplied.contains(row.event.id.as_bytes().as_slice())
+                && seen.insert(row.event.id)
+            {
                 events.push(serde_json::to_value(&row.event).unwrap_or(Value::Null));
             }
         }
@@ -182,6 +254,47 @@ pub(crate) async fn http_read(
     } else {
         Value::Array(events)
     }))
+}
+
+/// The latest kind 0 of each of `authors` who has posted in the peer's
+/// channel; the rest are left out without saying so.
+async fn read_author_profiles(
+    state: &AppState,
+    tenant: &TenantContext,
+    scope: PeerConnectionScope,
+    authors: &[Vec<u8>],
+) -> buzz_db::Result<Value> {
+    let allowed = state
+        .db
+        .channel_authors_among(tenant.community(), scope.channel_id, authors)
+        .await?;
+    if allowed.is_empty() {
+        return Ok(Value::Array(Vec::new()));
+    }
+    let mut filter = Filter::new().kind(nostr::Kind::Metadata);
+    for author in &allowed {
+        if let Ok(pubkey) = nostr::PublicKey::from_slice(author) {
+            filter = filter.author(pubkey);
+        }
+    }
+    let query = crate::handlers::req::build_event_query_from_filter(
+        &filter,
+        &[],
+        state,
+        tenant.community(),
+    )
+    .await;
+    let rows = state.db.query_events(&query).await?;
+    Ok(Value::Array(
+        rows.into_iter()
+            .filter(|row| {
+                row.event.kind == nostr::Kind::Metadata
+                    && row.channel_id.is_none()
+                    && allowed.contains(row.event.pubkey.to_bytes().as_slice())
+            })
+            .filter_map(|row| serde_json::to_value(&row.event).ok())
+            .collect(),
+    ))
 }
 
 fn is_tag_key(key: &str) -> bool {
@@ -196,8 +309,6 @@ fn is_tag_key(key: &str) -> bool {
 /// `event_id` is the admin command that ended it, for the closing `OK`.
 ///
 /// Returns the row as disconnected, or `None` when it was not live.
-// The disconnect admin command (docs/buzz-connect.md, phase 3) calls this.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) async fn disconnect(
     state: &AppState,
     tenant: &TenantContext,
@@ -223,5 +334,7 @@ pub(crate) async fn disconnect(
     Ok(ended)
 }
 
+#[cfg(test)]
+mod connect_postgres_tests;
 #[cfg(test)]
 mod postgres_tests;

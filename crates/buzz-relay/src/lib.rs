@@ -7,6 +7,7 @@ pub(crate) mod access;
 mod admission;
 mod build_info;
 mod channel_connect;
+pub use channel_connect::mirror::spawn_supervisor as spawn_channel_connect_mirror;
 mod community_active;
 mod fenced_cache;
 mod host_cache;

@@ -322,13 +322,39 @@ pub enum IngestAuth {
         /// How the HTTP request was authenticated.
         auth_method: HttpAuthMethod,
     },
+    /// Buzz Connect mirror path, relay-internal only: an event a peer relay
+    /// served for a shared channel, signed by its own author. It is admitted
+    /// as that author for the synced kinds in `channel_id` only, without the
+    /// timestamp-drift, membership and media-reference checks; bans, the
+    /// signature and edit/delete ownership still apply
+    /// (docs/buzz-connect.md, "Mirroring").
+    Mirror {
+        /// The event's author.
+        author: nostr::PublicKey,
+        /// The shared channel the connection serves.
+        channel_id: Uuid,
+    },
 }
+
+/// Scopes the mirror path holds; [`MIRRORED_KINDS`] bounds what it stores.
+const MIRROR_SCOPES: &[Scope] = &[Scope::MessagesWrite, Scope::UsersWrite];
+
+/// Kinds the mirror path stores: messages and replies, reactions, edits,
+/// deletions, and the authors' profiles.
+pub(crate) const MIRRORED_KINDS: [u32; 5] = [
+    KIND_STREAM_MESSAGE,
+    KIND_REACTION,
+    KIND_STREAM_MESSAGE_EDIT,
+    KIND_DELETION,
+    KIND_PROFILE,
+];
 
 impl IngestAuth {
     /// The authenticated public key.
     pub fn pubkey(&self) -> &nostr::PublicKey {
         match self {
             Self::Nip42 { pubkey, .. } | Self::Http { pubkey, .. } => pubkey,
+            Self::Mirror { author, .. } => author,
         }
     }
 
@@ -341,6 +367,7 @@ impl IngestAuth {
     pub fn scopes(&self) -> &[Scope] {
         match self {
             Self::Nip42 { scopes, .. } | Self::Http { scopes, .. } => scopes,
+            Self::Mirror { .. } => MIRROR_SCOPES,
         }
     }
 
@@ -348,7 +375,7 @@ impl IngestAuth {
     pub fn conn_id(&self) -> Option<Uuid> {
         match self {
             Self::Nip42 { conn_id, .. } => Some(*conn_id),
-            Self::Http { .. } => None,
+            Self::Http { .. } | Self::Mirror { .. } => None,
         }
     }
 
@@ -368,6 +395,14 @@ impl IngestAuth {
     /// Whether this auth context is an HTTP request (not WebSocket).
     pub fn is_http(&self) -> bool {
         matches!(self, Self::Http { .. })
+    }
+
+    /// The shared channel, when this is the Buzz Connect mirror path.
+    pub fn mirror_channel(&self) -> Option<Uuid> {
+        match self {
+            Self::Mirror { channel_id, .. } => Some(*channel_id),
+            _ => None,
+        }
     }
 }
 
@@ -647,6 +682,7 @@ fn required_scope_for_kind(kind: u32, event: &Event) -> Result<Scope, &'static s
         KIND_NIP29_PUT_USER | KIND_NIP29_REMOVE_USER | KIND_NIP29_DELETE_GROUP => {
             Ok(Scope::AdminChannels)
         }
+        k if buzz_core::kind::is_channel_connect_command_kind(k) => Ok(Scope::AdminChannels),
         // NIP-43: relay membership admin commands (9030–9032) + Buzz
         // workspace-profile command (9033).
         k if k == RELAY_ADMIN_ADD_MEMBER
@@ -1459,6 +1495,7 @@ async fn validate_edit_ownership(
     community_id: CommunityId,
     event: &Event,
     state: &AppState,
+    mirrored: bool,
 ) -> Result<(), String> {
     let target_bytes = buzz_core::media::first_edit_target(event)
         .ok_or_else(|| "missing e tag for edit target".to_string())?;
@@ -1477,6 +1514,15 @@ async fn validate_edit_ownership(
         .ok_or_else(|| EDIT_TARGET_DENIED.to_string())?;
 
     let author = effective_message_author(&target_event.event, &state.relay_keypair.public_key());
+    if mirrored {
+        // A mirrored edit is its author's own or nothing; the author is not a
+        // member here, so there is no channel write gate to re-pass.
+        return if author == actor {
+            Ok(())
+        } else {
+            Err(EDIT_TARGET_DENIED.to_string())
+        };
+    }
     if author == actor {
         // Author editing their own message: re-gate on the channel write gate so that
         // a removed private-channel member cannot mutate old messages after access is revoked.
@@ -2667,10 +2713,19 @@ async fn ingest_event_inner(
         });
     }
 
+    // The mirror path stores only the synced kinds, and skips the drift
+    // check: a peer's history is old by nature (decision 7).
+    let mirror_channel = auth.mirror_channel();
+    if mirror_channel.is_some() && !MIRRORED_KINDS.contains(&kind_u32) {
+        return Err(IngestError::Rejected(
+            "invalid: kind is not mirrored".into(),
+        ));
+    }
+
     const MAX_TIMESTAMP_DRIFT_SECS: i64 = 900; // ±15 minutes
     let now = chrono::Utc::now().timestamp();
     let event_ts = event.created_at.as_secs() as i64;
-    if (event_ts - now).abs() > MAX_TIMESTAMP_DRIFT_SECS {
+    if mirror_channel.is_none() && (event_ts - now).abs() > MAX_TIMESTAMP_DRIFT_SECS {
         return Err(IngestError::Rejected(
             "invalid: event timestamp too far from server time".into(),
         ));
@@ -2737,6 +2792,24 @@ async fn ingest_event_inner(
     // pubkey/auth match, and scope validation — never before.
     if buzz_core::kind::is_command_kind(kind_u32) {
         return super::command_executor::handle_command(tenant, state, event, auth).await;
+    }
+
+    // Buzz Connect commands are community-global admin operations, answered
+    // in the `OK` message and never stored.
+    if buzz_core::kind::is_channel_connect_command_kind(kind_u32) {
+        if auth.channel_ids().is_some() || auth.mirror_channel().is_some() {
+            return Err(IngestError::AuthFailed(
+                "restricted: channel connection commands require a global token".into(),
+            ));
+        }
+        let message = crate::channel_connect::handshake::handle_command(state, tenant, &event)
+            .await
+            .map_err(IngestError::Rejected)?;
+        return Ok(IngestResult {
+            event_id: event_id_hex,
+            accepted: true,
+            message,
+        });
     }
 
     // Product feedback is sidecarred directly into its private deployment table.
@@ -2850,7 +2923,7 @@ async fn ingest_event_inner(
         match crate::handlers::side_effects::extract_target_event_ids(&event).first() {
             Some(target_id) => {
                 let actor = effective_message_author(&event, &state.relay_keypair.public_key());
-                crate::handlers::side_effects::authorized_standard_deletion_target(
+                let target = crate::handlers::side_effects::authorized_standard_deletion_target(
                     tenant, state, &actor, target_id,
                 )
                 .await
@@ -2859,8 +2932,17 @@ async fn ingest_event_inner(
                 })?
                 .ok_or_else(|| {
                     target_denied(crate::handlers::side_effects::DELETION_TARGET_DENIED)
-                })?
-                .channel_id
+                })?;
+                // A mirrored deletion is its author's own (decision 5).
+                if mirror_channel.is_some()
+                    && effective_message_author(&target.event, &state.relay_keypair.public_key())
+                        != actor
+                {
+                    return Err(target_denied(
+                        crate::handlers::side_effects::DELETION_TARGET_DENIED,
+                    ));
+                }
+                target.channel_id
             }
             None => None,
         }
@@ -2876,6 +2958,17 @@ async fn ingest_event_inner(
         return Err(IngestError::Rejected(
             "invalid: channel-scoped events must include an h tag".into(),
         ));
+    }
+
+    // A mirrored event lands in the shared channel and nowhere else: a
+    // profile is global, everything else must resolve to that channel.
+    if let Some(shared) = mirror_channel {
+        let expected = (kind_u32 != KIND_PROFILE).then_some(shared);
+        if channel_id != expected {
+            return Err(IngestError::Rejected(
+                "invalid: event is outside the shared channel".into(),
+            ));
+        }
     }
 
     if let Some(ch_id) = channel_id {
@@ -2926,7 +3019,9 @@ async fn ingest_event_inner(
             }),
         _ => None,
     };
-    if let Some(ch_id) = channel_id {
+    // The mirror path's authors are not members here; the shared channel
+    // check above is its channel gate.
+    if let Some(ch_id) = channel_id.filter(|_| mirror_channel.is_none()) {
         // kind:9021 (join) doesn't require prior membership.
         // kind:9007 (create) — channel doesn't exist yet; creator becomes owner in step 16.
         // kind:40003/9002/9005/9008 — per-kind validators are the authority; they
@@ -3180,7 +3275,7 @@ async fn ingest_event_inner(
     }
 
     if kind_u32 == KIND_STREAM_MESSAGE_EDIT {
-        validate_edit_ownership(tenant.community(), &event, state)
+        validate_edit_ownership(tenant.community(), &event, state, mirror_channel.is_some())
             .await
             .map_err(|e| IngestError::Rejected(format!("invalid: {e}")))?;
     }
@@ -3417,12 +3512,15 @@ async fn ingest_event_inner(
 
     let tenant_media_base =
         crate::api::media::media_base_url_for_tenant(&state.config.relay_url, tenant.host());
-    if kind_u32 == KIND_STREAM_MESSAGE {
-        validate_link_preview_tags(&event, &tenant_media_base)
-            .map_err(|e| IngestError::Rejected(format!("invalid: {e}")))?;
+    // Mirrored media points at the peer's Blossom, not ours (decision 9):
+    // stored as sent, shown as a link.
+    if mirror_channel.is_none() {
+        if kind_u32 == KIND_STREAM_MESSAGE {
+            validate_link_preview_tags(&event, &tenant_media_base)
+                .map_err(|e| IngestError::Rejected(format!("invalid: {e}")))?;
+        }
+        validate_event_imeta(tenant, state, &event, &tenant_media_base).await?;
     }
-
-    validate_event_imeta(tenant, state, &event, &tenant_media_base).await?;
 
     let thread_meta = if requires_h_channel_scope(kind_u32) {
         if let Some(ch_id) = channel_id {
@@ -3789,7 +3887,13 @@ async fn ingest_event_inner(
         || atomic_deletion
         || kind_u32 == KIND_NIP29_PUT_USER
         || kind_u32 == KIND_NIP29_EDIT_METADATA;
-    if !persisted_atomically && crate::handlers::side_effects::is_side_effect_kind(kind_u32) {
+    // A mirrored profile is stored as an event only: no `users` row, so the
+    // remote author stays out of this community's directory (decision 6).
+    let mirrored_profile = mirror_channel.is_some() && kind_u32 == KIND_PROFILE;
+    if !persisted_atomically
+        && !mirrored_profile
+        && crate::handlers::side_effects::is_side_effect_kind(kind_u32)
+    {
         if let Err(e) =
             crate::handlers::side_effects::handle_side_effects(tenant, kind_u32, &event, state)
                 .await

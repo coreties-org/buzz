@@ -123,6 +123,10 @@ const NIP_FI_EXEMPT_PREFIXES: &[&str] = &[
     "/api/invites/claim",
     // Pre-membership policy gate — no NIP-98 principal yet
     "/api/invites/accept-policy",
+    // Buzz Connect relay-to-relay calls — NIP-98 by a peer relay's connection
+    // key, which is never a member and carries no federated identity
+    "/api/channel-connect/redeem",
+    "/api/channel-connect/status",
     // Public policy documents — exact path + subtree
     "/api/join-policy",
     // Webhook trigger — secret-header auth; subtree for /hooks/{id}
@@ -544,6 +548,17 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             post(api::invites::accept_policy),
         )
         .route("/api/invites/claim", post(api::invites::claim_invite))
+        // Buzz Connect relay-to-relay endpoints (NIP-FI exempt; NIP-98 by the
+        // peer's connection key, authorized by the one-time code or the
+        // active connection row).
+        .route(
+            crate::channel_connect::handshake::REDEEM_PATH,
+            post(crate::channel_connect::handshake::redeem),
+        )
+        .route(
+            crate::channel_connect::handshake::STATUS_PATH,
+            post(crate::channel_connect::handshake::status),
+        )
         // NIP-FI admin command API — authenticated by signed command JWT,
         // NOT by NIP-98.  Self-contained auth inside the handler.
         .route("/api/nip-fi/disconnect", post(api::nip_fi::disconnect))

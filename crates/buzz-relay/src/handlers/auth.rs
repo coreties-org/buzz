@@ -903,9 +903,7 @@ pub async fn handle_auth(event: nostr::Event, conn: Arc<ConnectionState>, state:
             if let Some(scope) = peer_scope {
                 auth_ctx.channel_ids = Some(vec![scope.channel_id]);
                 auth_ctx.peer_connection = Some(scope.connection_id);
-                state
-                    .conn_manager
-                    .set_peer_channel(conn_id, scope.channel_id);
+                state.conn_manager.set_peer_scope(conn_id, scope);
             }
 
             // Open relay NIP-OA backfill: extract owner for agent→owner DB mapping
