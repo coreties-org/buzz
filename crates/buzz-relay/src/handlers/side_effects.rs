@@ -1686,6 +1686,13 @@ pub async fn emit_group_discovery_events(
 ) -> anyhow::Result<()> {
     let relay_pubkey_hex = hex::encode(state.relay_keypair.public_key().to_bytes());
     let group_id = channel_id.to_string();
+    // Buzz Connect: `["connected", <peer relay>, <peer name>]` per live connection.
+    let connected = crate::channel_connect::handshake::connected_tags(
+        &state
+            .db
+            .list_channel_connections(tenant.community(), channel_id)
+            .await?,
+    );
 
     emit_addressable_discovery_event(
         tenant,
@@ -1696,6 +1703,7 @@ pub async fn emit_group_discovery_events(
         |channel, members| {
             Ok(buzz_db::channel::group_metadata_tags(channel, members)
                 .into_iter()
+                .chain(connected.iter().cloned())
                 .map(Tag::parse)
                 .collect::<Result<Vec<_>, _>>()?)
         },

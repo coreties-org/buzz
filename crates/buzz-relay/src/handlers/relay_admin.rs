@@ -1323,6 +1323,7 @@ mod postgres_tests {
             pubkey: f.member.public_key(),
             scopes: buzz_auth::Scope::all_known(),
             channel_ids: None,
+            peer_connection: None,
             auth_method: buzz_auth::AuthMethod::Nip42,
             agent_owner_pubkey: None,
         });

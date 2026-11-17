@@ -1457,6 +1457,7 @@ dependencies = [
  "buzz-sdk",
  "buzz-search",
  "buzz-workflow",
+ "buzz-ws-client",
  "bytes",
  "chrono",
  "dashmap",

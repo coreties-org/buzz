@@ -461,6 +461,16 @@ pub const KIND_IA_ARCHIVE_REQUEST: u32 = 9035;
 /// NIP-IA: Request that the relay unarchive a target identity.
 pub const KIND_IA_UNARCHIVE_REQUEST: u32 = 9036;
 
+// Buzz Connect shared-channel commands (admin-signed, never stored;
+// docs/buzz-connect.md)
+/// Buzz Connect: offer a channel to another community. The relay answers with
+/// the one-time `buzz://channel-connect` link in the `OK` message.
+pub const KIND_CHANNEL_CONNECT_OFFER: u32 = 9037;
+/// Buzz Connect: accept another community's link, creating the shared copy.
+pub const KIND_CHANNEL_CONNECT_ACCEPT: u32 = 9038;
+/// Buzz Connect: end a channel's connections from this side.
+pub const KIND_CHANNEL_DISCONNECT: u32 = 9039;
+
 // NIP-IA identity archival announcement events (relay-signed)
 /// NIP-IA: Archived-identity delta (relay-signed).
 pub const KIND_IA_ARCHIVED: u32 = 8002;
@@ -753,6 +763,9 @@ pub const ALL_KINDS: &[u32] = &[
     KIND_NIP43_LEAVE_REQUEST,
     KIND_IA_ARCHIVE_REQUEST,
     KIND_IA_UNARCHIVE_REQUEST,
+    KIND_CHANNEL_CONNECT_OFFER,
+    KIND_CHANNEL_CONNECT_ACCEPT,
+    KIND_CHANNEL_DISCONNECT,
     KIND_IA_ARCHIVED,
     KIND_IA_UNARCHIVED,
     KIND_IA_ARCHIVED_LIST,
@@ -912,6 +925,14 @@ pub const fn is_command_kind(kind: u32) -> bool {
             | KIND_WORKFLOW_TRIGGER
             | KIND_APPROVAL_GRANT
             | KIND_APPROVAL_DENY
+    )
+}
+
+/// Returns `true` if `kind` is a Buzz Connect command (9037–9039).
+pub const fn is_channel_connect_command_kind(kind: u32) -> bool {
+    matches!(
+        kind,
+        KIND_CHANNEL_CONNECT_OFFER | KIND_CHANNEL_CONNECT_ACCEPT | KIND_CHANNEL_DISCONNECT
     )
 }
 

@@ -228,6 +228,30 @@ impl ProvenCaller {
         Ok(admitted)
     }
 
+    /// Buzz Connect: whether this caller is a peer relay's active connection
+    /// key, asked once relay membership refused it (closed relay) or before
+    /// serving it as anyone (open relay). `Some` admits it, for the scoped
+    /// reads in [`crate::channel_connect::http_read`] only. Never for an agent
+    /// token, whose refusal keeps NIP-FI's fixed shape.
+    pub(crate) async fn peer_connection(
+        &mut self,
+        state: &AppState,
+        tenant: &TenantContext,
+    ) -> Result<Option<buzz_db::channel_connection::PeerConnectionScope>, (StatusCode, Json<Value>)>
+    {
+        if self.token_owner.is_some() {
+            return Ok(None);
+        }
+        let scope =
+            crate::channel_connect::peer_scope(state, tenant.community(), &self.pubkey.to_bytes())
+                .await
+                .map_err(|e| internal_error(&format!("channel connection lookup: {e}")))?;
+        if scope.is_some() {
+            self.slot.finish(AuthResult::Success);
+        }
+        Ok(scope)
+    }
+
     /// [`Self::admit`] for the relay membership and ban check.
     pub(crate) fn admit_member<T>(
         &mut self,
@@ -1715,6 +1739,17 @@ async fn query_events_authed(
         caller.token_owner,
     )
     .await;
+    if membership.is_err() || !state.config.require_relay_membership {
+        if let Some(scope) = caller
+            .peer_connection(state, tenant)
+            .await
+            .map_err(IntoResponse::into_response)?
+        {
+            return crate::channel_connect::http_read(state, tenant, scope, body, false)
+                .await
+                .map_err(IntoResponse::into_response);
+        }
+    }
     caller
         .admit_member(membership)
         .map_err(IntoResponse::into_response)?;
@@ -2413,6 +2448,17 @@ async fn count_events_authed(
         caller.token_owner,
     )
     .await;
+    if membership.is_err() || !state.config.require_relay_membership {
+        if let Some(scope) = caller
+            .peer_connection(state, tenant)
+            .await
+            .map_err(IntoResponse::into_response)?
+        {
+            return crate::channel_connect::http_read(state, tenant, scope, body, true)
+                .await
+                .map_err(IntoResponse::into_response);
+        }
+    }
     caller
         .admit_member(membership)
         .map_err(IntoResponse::into_response)?;
@@ -10529,6 +10575,7 @@ pub(crate) mod postgres_tests {
                         pubkey: self.reader.public_key(),
                         scopes: Vec::new(),
                         channel_ids: None,
+                        peer_connection: None,
                         auth_method: buzz_auth::AuthMethod::Nip42,
                         agent_owner_pubkey: None,
                     },

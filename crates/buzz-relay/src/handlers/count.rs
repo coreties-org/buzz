@@ -25,11 +25,13 @@ pub async fn handle_count(
 ) {
     let mut access = crate::access::ReadLog::count(&conn, &sub_id, &filters);
     // Require auth
-    let (pubkey_bytes, token_channel_ids) = {
+    let (pubkey_bytes, token_channel_ids, peer) = {
         match conn.auth_state_snapshot() {
-            AuthState::Authenticated(ctx) => {
-                (ctx.pubkey.to_bytes().to_vec(), ctx.channel_ids.clone())
-            }
+            AuthState::Authenticated(ctx) => (
+                ctx.pubkey.to_bytes().to_vec(),
+                ctx.channel_ids.clone(),
+                ctx.peer_connection.is_some(),
+            ),
             _ => {
                 conn.send(RelayMessage::closed(
                     &sub_id,
@@ -87,11 +89,16 @@ pub async fn handle_count(
             }
         };
 
-    // Get channels this user can access — same enforcement as WS REQ handler.
-    let mut accessible_channels = match state
-        .get_accessible_channel_ids_cached(conn.tenant.community(), &pubkey_bytes)
-        .await
-    {
+    // Get channels this user can access — same enforcement as WS REQ handler,
+    // including a Buzz Connect peer key's replacement scope.
+    let accessible = if peer {
+        Ok(token_channel_ids.clone().unwrap_or_default())
+    } else {
+        state
+            .get_accessible_channel_ids_cached(conn.tenant.community(), &pubkey_bytes)
+            .await
+    };
+    let mut accessible_channels = match accessible {
         Ok(ids) => ids,
         Err(e) => {
             warn!(sub_id = %sub_id, error_kind = %e.kind(), "Failed to get accessible channels");
@@ -452,6 +459,7 @@ mod tests {
                     pubkey: keys.public_key(),
                     scopes: vec![],
                     channel_ids: None,
+                    peer_connection: None,
                     auth_method: buzz_auth::AuthMethod::Nip42,
                     agent_owner_pubkey: None,
                 },

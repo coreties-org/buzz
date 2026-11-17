@@ -1013,6 +1013,9 @@ async fn run_relay_main(boot: BootTracker) -> anyhow::Result<()> {
     let wf_cron = Arc::clone(&workflow_engine);
     tokio::spawn(async move { wf_cron.run().await });
 
+    // Buzz Connect: pull shared channels from peer relays (leader-only).
+    buzz_relay::spawn_channel_connect_mirror(Arc::clone(&state));
+
     // Ephemeral channel reaper — archives channels whose TTL deadline has passed.
     // Runs every 60s, matching the workflow cron loop pattern. The SQL UPDATE
     // uses `archived_at IS NULL` as a guard, so concurrent runs from multiple

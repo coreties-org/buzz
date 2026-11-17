@@ -57,6 +57,34 @@ fn classify_relay_membership(
     }
 }
 
+/// Buzz Connect: whether a key refused as a person is instead a peer relay's
+/// active connection key, recording its scope in `peer`. Never for a NIP-FI
+/// session or agent token, whose refusals keep their fixed shape.
+async fn peer_admission(
+    state: &AppState,
+    conn: &ConnectionState,
+    pubkey: nostr::PublicKey,
+    token_owner: Option<nostr::PublicKey>,
+    peer: &mut Option<buzz_db::channel_connection::PeerConnectionScope>,
+) -> PolicyCheck<()> {
+    if token_owner.is_some() || conn.nip_fi_assertion.is_some() {
+        return PolicyCheck::Denied;
+    }
+    match crate::channel_connect::peer_scope(state, conn.tenant.community(), pubkey.as_bytes())
+        .await
+    {
+        Ok(Some(scope)) => {
+            *peer = Some(scope);
+            PolicyCheck::Allowed(())
+        }
+        Ok(None) => PolicyCheck::Denied,
+        Err(e) => {
+            warn!(pubkey = %pubkey.to_hex(), error = %e, "channel connection lookup failed, denying (fail-closed)");
+            PolicyCheck::DependencyError
+        }
+    }
+}
+
 /// Community-ban verdict for an authenticating principal: shared by every
 /// socket auth seam (root and audio) so they cannot drift.
 ///
@@ -319,6 +347,7 @@ pub(crate) async fn final_admission_denial(
     auth_tag_json: Option<&str>,
     signed_auth_created_at: Option<u64>,
     token_owner: Option<nostr::PublicKey>,
+    peer_scope: Option<buzz_db::channel_connection::PeerConnectionScope>,
 ) -> Option<AdmissionDenial> {
     let ban = community_ban_verdict(
         state,
@@ -332,6 +361,30 @@ pub(crate) async fn final_admission_denial(
     .await;
     if let Some(denial) = ban_verdict_denial(ban) {
         return Some(denial);
+    }
+    // A peer key holds no membership: its connection must still be active,
+    // for the same channel, or a disconnect that already ran is undone.
+    if let Some(admitted) = peer_scope {
+        return match crate::channel_connect::peer_scope(state, community, pubkey.as_bytes()).await {
+            Ok(Some(current)) if current == admitted => None,
+            Ok(_) => Some(AdmissionDenial {
+                metric: "channel_connection_ended",
+                reason: "blocked: channel connection ended",
+                outcome: AuthOutcome::NotRelayMember,
+                class: buzz_auth::DenialClass::AuthorizationDenied,
+                owner_reason: None,
+            }),
+            Err(e) => {
+                warn!(pubkey = %pubkey.to_hex(), error = %e, "channel connection recheck failed, denying (fail-closed)");
+                Some(AdmissionDenial {
+                    metric: "relay_membership_check_error",
+                    reason: "error: internal error checking relay membership",
+                    outcome: AuthOutcome::RelayMembershipCheckError,
+                    class: buzz_auth::DenialClass::AuthorizationUnavailable,
+                    owner_reason: None,
+                })
+            }
+        };
     }
     match crate::api::relay_members::check_relay_membership_authoritative(
         state,
@@ -696,6 +749,17 @@ pub async fn handle_auth(event: nostr::Event, conn: Arc<ConnectionState>, state:
                 }
             }
 
+            // Buzz Connect: set when this key is a peer relay's connection
+            // key, admitted to read one channel instead of as a person. An
+            // open relay admits every key, so there it is recognised first;
+            // a closed relay looks only once membership refuses the key.
+            let mut peer_scope = None;
+            let open_relay_peer_check = if state.config.require_relay_membership {
+                PolicyCheck::Denied
+            } else {
+                peer_admission(&state, &conn, pubkey, token_owner, &mut peer_scope).await
+            };
+
             // Pubkey allowlist gate — only for pubkey-only auth.
             if state.config.pubkey_allowlist_enabled
                 && auth_ctx.auth_method == buzz_auth::AuthMethod::Nip42
@@ -708,7 +772,14 @@ pub async fn handle_auth(event: nostr::Event, conn: Arc<ConnectionState>, state:
                     warn!(conn_id = %conn_id, pubkey = %pubkey.to_hex(), error = %e,
                               "allowlist DB lookup failed, denying (fail-closed)");
                 }
-                match classify_allowlist(allowlist) {
+                let allowlist = match classify_allowlist(allowlist) {
+                    PolicyCheck::Denied if peer_scope.is_some() => PolicyCheck::Allowed(()),
+                    PolicyCheck::Denied => {
+                        peer_admission(&state, &conn, pubkey, token_owner, &mut peer_scope).await
+                    }
+                    other => other,
+                };
+                match allowlist {
                     PolicyCheck::Allowed(()) => {}
                     PolicyCheck::Denied => {
                         metrics::counter!("buzz_auth_failures_total", "reason" => "allowlist_denied")
@@ -755,21 +826,41 @@ pub async fn handle_auth(event: nostr::Event, conn: Arc<ConnectionState>, state:
                 }
             }
 
-            // Relay membership gate — uses the shared helper with NIP-OA fallback.
-            let membership = crate::api::relay_members::check_relay_membership(
-                &state,
-                conn.tenant.community(),
-                pubkey.as_bytes(),
-                auth_tag_json.as_deref(),
-                Some(signed_auth_created_at),
-                token_owner,
-            )
-            .await;
-            if let Err(e) = &membership {
-                warn!(conn_id = %conn_id, pubkey = %pubkey.to_hex(), error = %e,
-                    "relay membership DB lookup failed, denying (fail-closed)");
-            }
-            let nip_oa_owner = match classify_relay_membership(membership) {
+            // Relay membership gate — uses the shared helper with NIP-OA
+            // fallback. It never admits a peer key; a refused key is admitted
+            // as one only if it matches an active connection.
+            let membership = if peer_scope.is_some() {
+                PolicyCheck::Allowed(None)
+            } else if open_relay_peer_check == PolicyCheck::DependencyError {
+                PolicyCheck::DependencyError
+            } else {
+                let membership = crate::api::relay_members::check_relay_membership(
+                    &state,
+                    conn.tenant.community(),
+                    pubkey.as_bytes(),
+                    auth_tag_json.as_deref(),
+                    Some(signed_auth_created_at),
+                    token_owner,
+                )
+                .await;
+                if let Err(e) = &membership {
+                    warn!(conn_id = %conn_id, pubkey = %pubkey.to_hex(), error = %e,
+                        "relay membership DB lookup failed, denying (fail-closed)");
+                }
+                match classify_relay_membership(membership) {
+                    PolicyCheck::Denied => {
+                        match peer_admission(&state, &conn, pubkey, token_owner, &mut peer_scope)
+                            .await
+                        {
+                            PolicyCheck::Allowed(()) => PolicyCheck::Allowed(None),
+                            PolicyCheck::Denied => PolicyCheck::Denied,
+                            PolicyCheck::DependencyError => PolicyCheck::DependencyError,
+                        }
+                    }
+                    other => other,
+                }
+            };
+            let nip_oa_owner = match membership {
                 PolicyCheck::Allowed(owner) => owner,
                 PolicyCheck::Denied => {
                     metrics::counter!("buzz_auth_failures_total", "reason" => "not_relay_member")
@@ -808,6 +899,12 @@ pub async fn handle_auth(event: nostr::Event, conn: Arc<ConnectionState>, state:
                     return;
                 }
             };
+
+            if let Some(scope) = peer_scope {
+                auth_ctx.channel_ids = Some(vec![scope.channel_id]);
+                auth_ctx.peer_connection = Some(scope.connection_id);
+                state.conn_manager.set_peer_scope(conn_id, scope);
+            }
 
             // Open relay NIP-OA backfill: extract owner for agent→owner DB mapping
             // (needed for observer frame auth). Only runs on open relays — on closed
@@ -934,6 +1031,7 @@ pub async fn handle_auth(event: nostr::Event, conn: Arc<ConnectionState>, state:
                 auth_tag_json.as_deref(),
                 Some(signed_auth_created_at),
                 token_owner,
+                peer_scope,
             )
             .await
             {
@@ -1016,7 +1114,8 @@ pub async fn handle_auth(event: nostr::Event, conn: Arc<ConnectionState>, state:
             // the ones they have never been in, under this socket's effect
             // permits. Agents are not.
             let auto_join = !state.config.require_relay_membership && !admitted_agent;
-            {
+            // A peer key joins nothing: it reads its connection's channel only.
+            if peer_scope.is_none() {
                 let state = Arc::clone(&state);
                 let tenant = conn.tenant.clone();
                 let gate = Arc::clone(&conn.nip_fi_gate);

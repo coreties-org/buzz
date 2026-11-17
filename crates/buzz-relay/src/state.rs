@@ -453,6 +453,8 @@ struct ConnEntry {
     nip_fi: std::sync::RwLock<Option<NipFiSession>>,
     /// Owner of an admitted agent; revoking the owner closes this socket.
     admitted_owner: std::sync::OnceLock<[u8; 32]>,
+    /// The connection and channel of a Buzz Connect peer connection.
+    peer_scope: std::sync::OnceLock<buzz_db::channel_connection::PeerConnectionScope>,
     /// Set once AUTH succeeds. The pubkey is bound earlier so revocation can
     /// find a socket mid-admission; online counts and presence read this.
     admitted: AtomicBool,
@@ -883,6 +885,7 @@ impl ConnectionManager {
                 authenticated_pubkey: Arc::new(std::sync::RwLock::new(None)),
                 nip_fi: std::sync::RwLock::new(None),
                 admitted_owner: std::sync::OnceLock::new(),
+                peer_scope: std::sync::OnceLock::new(),
                 admitted: AtomicBool::new(false),
                 grace_limit,
                 community_control,
@@ -969,6 +972,29 @@ impl ConnectionManager {
         if let Some(entry) = self.connections.get(&conn_id) {
             let _ = entry.admitted_owner.set(owner);
         }
+    }
+
+    /// Record that `conn_id` is a Buzz Connect peer connection with `scope`.
+    /// Set during AUTH, before the socket can subscribe; fan-out then
+    /// delivers it that channel's synced kinds and nothing else.
+    pub(crate) fn set_peer_scope(
+        &self,
+        conn_id: Uuid,
+        scope: buzz_db::channel_connection::PeerConnectionScope,
+    ) {
+        if let Some(entry) = self.connections.get(&conn_id) {
+            let _ = entry.peer_scope.set(scope);
+        }
+    }
+
+    /// The scope of a peer connection, `None` for every other socket.
+    pub(crate) fn peer_scope_for_conn(
+        &self,
+        conn_id: Uuid,
+    ) -> Option<buzz_db::channel_connection::PeerConnectionScope> {
+        self.connections
+            .get(&conn_id)
+            .and_then(|entry| entry.peer_scope.get().copied())
     }
 
     /// Mark `conn_id` admitted, once AUTH has succeeded.

@@ -143,7 +143,60 @@ struct FanoutAccess {
 
 /// `filter_fanout_by_access`, also reporting the recipients it dropped
 /// only because a lookup failed.
+///
+/// A Buzz Connect peer connection is decided here, without a membership
+/// read: it receives its own channel's synced kinds, member or not, and
+/// nothing else, whatever its subscriptions match. An event that peer
+/// supplied is never sent back to it (loop filter); that costs one read,
+/// only when a peer socket matched.
 async fn check_fanout_access(
+    state: &AppState,
+    community_id: CommunityId,
+    stored_event: &StoredEvent,
+    matches: Vec<(crate::subscription::ConnId, crate::subscription::SubId)>,
+    threaded: Option<&crate::state::ThreadedChannelVisibility>,
+) -> FanoutAccess {
+    let (peers, matches): (Vec<_>, Vec<_>) = matches
+        .into_iter()
+        .partition(|(conn_id, _)| state.conn_manager.peer_scope_for_conn(*conn_id).is_some());
+    let mut access =
+        check_member_fanout_access(state, community_id, stored_event, matches, threaded).await;
+    if peers.is_empty() {
+        return access;
+    }
+    let readable =
+        crate::channel_connect::PEER_READABLE_KINDS.contains(&event_kind_u32(&stored_event.event));
+    let mut in_scope = Vec::new();
+    for (conn_id, sub_id) in peers {
+        let Some(scope) = state.conn_manager.peer_scope_for_conn(conn_id) else {
+            continue;
+        };
+        if readable
+            && state.conn_manager.community_for_conn(conn_id) == Some(community_id)
+            && Some(scope.channel_id) == stored_event.channel_id
+        {
+            in_scope.push((scope.connection_id, (conn_id, sub_id)));
+        }
+    }
+    for (connection_id, recipient) in in_scope {
+        match crate::channel_connect::supplied_by(
+            state,
+            community_id,
+            connection_id,
+            stored_event.event.id.as_bytes(),
+        )
+        .await
+        {
+            Ok(false) => access.allowed.push(recipient),
+            Ok(true) => {}
+            Err(_) => access.unverified.push(recipient),
+        }
+    }
+    access
+}
+
+/// [`check_fanout_access`] for every recipient that is not a peer connection.
+async fn check_member_fanout_access(
     state: &AppState,
     community_id: CommunityId,
     stored_event: &StoredEvent,
@@ -1839,6 +1892,7 @@ mod tests {
                     pubkey: agent.public_key(),
                     scopes: vec![],
                     channel_ids: None,
+                    peer_connection: None,
                     auth_method: buzz_auth::AuthMethod::Nip42,
                     agent_owner_pubkey: None,
                 },
@@ -1929,6 +1983,7 @@ mod tests {
                         pubkey: keys.public_key(),
                         scopes: vec![],
                         channel_ids: None,
+                        peer_connection: None,
                         auth_method: buzz_auth::AuthMethod::Nip42,
                         agent_owner_pubkey: None,
                     },
@@ -2091,6 +2146,7 @@ mod tests {
                         pubkey: owner.public_key(),
                         scopes: vec![],
                         channel_ids: None,
+                        peer_connection: None,
                         auth_method: buzz_auth::AuthMethod::Nip42,
                         agent_owner_pubkey: None,
                     },
@@ -2214,6 +2270,7 @@ mod tests {
                         pubkey: keys.public_key(),
                         scopes: vec![],
                         channel_ids: None,
+                        peer_connection: None,
                         auth_method: buzz_auth::AuthMethod::Nip42,
                         agent_owner_pubkey: None,
                     },
@@ -3757,6 +3814,7 @@ mod tests {
                         pubkey: keys.public_key(),
                         scopes,
                         channel_ids: None,
+                        peer_connection: None,
                         auth_method: buzz_auth::AuthMethod::Nip42,
                         agent_owner_pubkey: None,
                     },
@@ -4184,6 +4242,7 @@ mod tests {
                         pubkey: key.public_key(),
                         scopes: vec![],
                         channel_ids: None,
+                        peer_connection: None,
                         auth_method: buzz_auth::AuthMethod::Nip42,
                         agent_owner_pubkey: None,
                     },
@@ -4378,6 +4437,7 @@ mod tests {
                         pubkey: agent_keys.public_key(),
                         scopes: vec![],
                         channel_ids: None,
+                        peer_connection: None,
                         auth_method: buzz_auth::AuthMethod::Nip42,
                         // Fast path: session owner matches the event's target owner,
                         // so `handle_agent_observer_event` skips the DB ownership lookup.

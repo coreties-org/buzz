@@ -637,6 +637,7 @@ pub(crate) fn test_conn(
                 pubkey: reader.public_key(),
                 scopes: Vec::new(),
                 channel_ids: None,
+                peer_connection: None,
                 auth_method: buzz_auth::AuthMethod::Nip42,
                 agent_owner_pubkey: None,
             },

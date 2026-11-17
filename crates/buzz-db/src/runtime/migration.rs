@@ -890,7 +890,7 @@ mod postgres_tests {
         let mut migrations: Vec<_> = MIGRATOR.iter().collect();
         migrations.sort_by_key(|migration| migration.version);
 
-        assert_eq!(migrations.len(), 92);
+        assert_eq!(migrations.len(), 93);
         assert_eq!(migrations[89].version, 90);
         assert!(migrations[89]
             .sql
@@ -921,6 +921,12 @@ mod postgres_tests {
         let retire_floor = strip_sql_comments(migrations[88].sql.as_str());
         assert!(retire_floor.contains("DROP TRIGGER IF EXISTS events_created_at_floor ON events;"));
         assert!(retire_floor.contains("DROP FUNCTION IF EXISTS events_created_at_floor_guard();"));
+        // 0093 adds the Buzz Connect tables (docs/buzz-connect.md).
+        assert_eq!(migrations[92].version, 93);
+        let connect = strip_sql_comments(migrations[92].sql.as_str());
+        assert!(connect.contains("CREATE TABLE channel_connections"));
+        assert!(connect.contains("CREATE TABLE mirrored_events"));
+        assert!(!connect.contains("REFERENCES"));
         for (index, migration) in migrations.iter().enumerate() {
             assert_eq!(migration.version, (index + 1) as i64);
         }
@@ -1491,6 +1497,8 @@ mod postgres_tests {
             "nip_fi_profile_heads",
             "media_uploaders",
             "media_publications",
+            "channel_connections",
+            "mirrored_events",
         ];
         for table in crate::deletion::EXPECTED_SCOPED_TABLES
             .iter()
@@ -3119,6 +3127,8 @@ mod postgres_tests {
             "entity_deletion_stage_history",
             "user_deletion_fences",
             "workflow_runs",
+            "channel_connections",
+            "mirrored_events",
         ] {
             assert_eq!(
                 columns(&desired, table).await,
@@ -3924,6 +3934,7 @@ mod postgres_tests {
             .run_to(retirement - 1, &pool)
             .await
             .expect("apply pre-retirement migrations");
+        crate::test_support::create_tables_added_after_fence_retirement(&pool).await;
         let store = crate::deletion::DeletionStore::new(pool.clone());
         store
             .validate_serving_catalog()
@@ -3933,6 +3944,7 @@ mod postgres_tests {
             .validate_catalog()
             .await
             .expect("deletion must accept pre-retirement catalog");
+        crate::test_support::drop_tables_added_after_fence_retirement(&pool).await;
         run_migrations(&pool).await.expect("apply all migrations");
         let fence_triggers: i64 = sqlx::query_scalar(
             "SELECT count(*) FROM pg_trigger WHERE NOT tgisinternal AND tgname LIKE 'community_write_fence_%'",

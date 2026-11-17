@@ -10,6 +10,8 @@ pub mod api_token;
 pub mod archived_identities;
 /// Channel lifecycle and metadata persistence.
 pub mod channel;
+/// Buzz Connect: channels shared with a community on another relay.
+pub mod channel_connection;
 /// Channel membership and roster persistence.
 pub mod channel_members;
 /// Community lifecycle and host-map persistence.

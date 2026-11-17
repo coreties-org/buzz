@@ -96,6 +96,7 @@ pub const EXPECTED_SCOPED_TABLES: &[&str] = &[
     "artifact_heads",
     "artifact_revisions",
     "audit_log",
+    "channel_connections",
     "channel_members",
     "channels",
     "community_bans",
@@ -107,6 +108,7 @@ pub const EXPECTED_SCOPED_TABLES: &[&str] = &[
     "join_policy_acceptances",
     "media_uploaders",
     "media_publications",
+    "mirrored_events",
     "moderation_actions",
     "moderation_reports",
     "parameterized_event_watermarks",
@@ -154,6 +156,8 @@ pub const PENDING_SCOPED_TABLES: &[&str] = &[
 /// `PENDING_SCOPED_TABLES`, so a request approved before its migration still
 /// runs on the release that requires it.
 pub const APPROVAL_FORWARD_TABLES: &[&str] = &[
+    "channel_connections",
+    "mirrored_events",
     "identity_retirement_actions",
     "identity_retirement_holds",
     "identity_retirement_workflows",
@@ -174,6 +178,8 @@ const EXCLUDED_SCOPED_TABLES: &[&str] = &[
 /// Foreign-key-safe child-before-parent order for the PostgreSQL purge.
 pub const PURGE_SCOPED_TABLES: &[&str] = &[
     "nip_fi_profile_heads",
+    "mirrored_events",
+    "channel_connections",
     "personal_read_frontiers",
     "personal_read_accounts",
     "workflow_approvals",
@@ -4700,6 +4706,7 @@ mod postgres_tests {
         crate::migration::run_migrations_through(&db.pool, 89)
             .await
             .expect("migrate with fence objects present");
+        crate::test_support::create_tables_added_after_fence_retirement(&db.pool).await;
         let store = db.deletion_store();
         let community = db
             .ensure_configured_community("optional-fences.example")
@@ -8172,6 +8179,50 @@ DROP FUNCTION community_deletion_lock_key(UUID);
         db.record_media_publications(request.community_id, vec![media_hash.clone()])
             .await
             .expect("publication boundary");
+        // Buzz Connect rows: one connection and one mirrored event.
+        let shared_channel = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO channels (community_id, id, name, created_by) VALUES ($1, $2, 'shared', $3)",
+        )
+        .bind(request.community_id.as_uuid())
+        .bind(shared_channel)
+        .bind(vec![4_u8; 32])
+        .execute(&db.pool)
+        .await
+        .expect("shared channel");
+        let connect = |code: u8| crate::channel_connection::NewChannelConnection {
+            community: request.community_id,
+            channel_id: shared_channel,
+            role: crate::channel_connection::ConnectionRole::Offerer,
+            local_pubkey: "aa".repeat(32).leak(),
+            local_secret_key: "bb".repeat(32).leak(),
+            offer_code_hash: Some([code; 32]),
+            offer_expires_at: Some(chrono::Utc::now() + chrono::Duration::hours(1)),
+            peer_pubkey: None,
+            peer_relay_url: None,
+            peer_community_name: None,
+            created_by: "admin",
+        };
+        let connection = db
+            .create_channel_connection(connect(1))
+            .await
+            .expect("channel connection");
+        let mut mirror = crate::begin_community_write_transaction(
+            &db.pool,
+            request.community_id,
+            crate::observability::WriterOperation::EventWrite,
+        )
+        .await
+        .expect("mirror transaction");
+        assert!(crate::channel_connection::record_mirrored_event(
+            &mut mirror,
+            connection.id,
+            &[5; 32],
+            "wss://peer.example",
+        )
+        .await
+        .expect("mirrored event"));
+        mirror.commit().await.expect("commit mirrored event");
         store
             .approve(request.id, "approver", None)
             .await
@@ -8188,6 +8239,11 @@ DROP FUNCTION community_deletion_lock_key(UUID);
             .is_err());
         assert!(db
             .record_media_publications(request.community_id, vec!["b".repeat(64)])
+            .await
+            .is_err());
+        assert!(db.create_channel_connection(connect(2)).await.is_err());
+        assert!(db
+            .disconnect_channel_connection(request.community_id, connection.id)
             .await
             .is_err());
         let generation = store.fence(&claim.lease).await.expect("fence");
@@ -8247,6 +8303,8 @@ DROP FUNCTION community_deletion_lock_key(UUID);
         let first = store.purge_postgres(&token).await.expect("purge postgres");
         assert_eq!(first["media_uploaders"], 1);
         assert_eq!(first["media_publications"], 1);
+        assert_eq!(first["channel_connections"], 1);
+        assert_eq!(first["mirrored_events"], 1);
         let expected_tables: BTreeSet<&str> = EXPECTED_SCOPED_TABLES
             .iter()
             .chain(RELAY_ADMIN_TABLES.iter().map(|(table, _)| table))

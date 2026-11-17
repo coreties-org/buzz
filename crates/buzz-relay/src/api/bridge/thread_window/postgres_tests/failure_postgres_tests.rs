@@ -177,6 +177,7 @@ async fn thread_window_bounds_rejected_by_ws_event_handler() {
         pubkey: f.keys.public_key(),
         scopes: vec![],
         channel_ids: None,
+        peer_connection: None,
         auth_method: buzz_auth::AuthMethod::Nip42,
         agent_owner_pubkey: None,
     });
